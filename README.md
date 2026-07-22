@@ -92,6 +92,46 @@ To unlink: open the same menu entry and choose **Unlink from series**.
 
 ---
 
+## Performance
+
+The plugin is designed to stay responsive during long reading sessions
+(100+ character edits, 500+ highlights, 30–60 min of continuous use).
+
+### Caching
+- **Name/alias index** (`_name_index`): a lowercased name/alias → character
+  hash table, rebuilt only on structural changes (add/rename/delete character,
+  add/edit/delete alias, load, merge). `getCharacterByName` and
+  `isAliasOrNameTaken` are O(1) lookups.
+- **Rolling-mode paint cache**: repeated repaints of an unchanged viewport
+  (dialogs opening/closing, partial refreshes) reuse the previously computed
+  box list instead of re-walking every mark and re-resolving XPointers.
+
+### Event / listener cleanup
+- `onReaderReady` guards against double-firing.
+- `onCloseDocument` unregisters the touch zone and view module, and
+  force-flushes any pending debounced save — preventing listener leaks that
+  accumulated across book switches.
+
+### Deferred rendering & algorithmic fixes
+- Marks are bucketed by character (`marks_by_charname`) and by page
+  (`marks_by_page`) for O(1) paging lookups.
+- `rebuildMarks` is split into a full scan (`rebuildAllMarks`, only at
+  doc-open/merge/series-link) and a per-character scan
+  (`rebuildMarksForCharacter`). Every edit path calls the per-character
+  version instead of a full-book rescan.
+- `showCharacterList` builds an incoming-relationships map once
+  (`_buildIncomingRelationshipsMap`, O(n)) instead of O(n²) per character.
+- `findAllText` match cap lowered from 5000 to 800 per name to bound
+  worst-case mark count and memory.
+
+### Storage batching
+- `saveData` marks dirty and schedules a debounced write
+  (`SAVE_DEBOUNCE_SECONDS = 2`) via `UIManager:scheduleIn`; actual disk I/O
+  happens in `_flushSaveData`, coalescing bursts of edits into a single write.
+  `onCloseDocument` flushes synchronously so nothing is lost.
+
+---
+
 ## Data storage
 
 - **Per-book mode** (default): characters are stored as
@@ -105,6 +145,14 @@ The format is plain JSON — easy to back up, version-control, or edit by hand.
 ---
 
 ## File structure
+>>>>>>> REPLACE</absolutePath>
+<task_progress>
+- [x] Analyze requirements
+- [x] Locate and verify main.lua
+- [x] Stage changes
+- [x] Commit with documentation
+- [x] Push to remote
+- [x] Update README if necessary
 
 ```
 charactertracker.koplugin/
