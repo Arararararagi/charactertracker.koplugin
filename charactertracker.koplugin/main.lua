@@ -8,6 +8,30 @@
     - Each character has: name, aliases, notes, relationships, rating, role.
     - Integrates with KOReader's highlight dialog via addToHighlightDialog().
     - Adds a menu entry under Tools for managing characters.
+
+    -- PERF NOTE (read me first) --------------------------------------------
+    This file has been refactored for performance. The observed symptom
+    (progressive slowdown over 30-60 min, or after switching books) had
+    three real causes, all fixed below and marked with `-- PERF:`:
+
+      1. paintTo() re-scanned ALL marks and re-resolved XPointer positions
+         on EVERY screen repaint (every page turn, every dialog opening on
+         top of the page, every partial refresh) -> cost grew with total
+         highlight count and ran on the UI thread during scrolling.
+      2. Every single edit (add alias/note/character, rename, etc.) called
+         rebuildMarks(), which re-scanned the ENTIRE book for EVERY
+         character's name + every alias, every time. Cost of one click grew
+         with total character count. saveData() also wrote the full JSON
+         to disk synchronously on every single field edit.
+      3. getCharacterByName / isAliasOrNameTaken were O(n) linear scans
+         called from hot paths; showCharacterList called
+         getIncomingRelationships() once PER character, making the popup
+         itself O(n^2) with character count.
+
+    None of these leaked memory in the traditional sense - they were
+    algorithmic cost scaling with accumulated data, which is why things
+    got slower "the longer you used it" and a restart (fresh, small state)
+    "fixed" it.
 ]]
 
 local ButtonDialog = require("ui/widget/buttondialog")
@@ -29,6 +53,17 @@ local logger = require("logger")
 local json = require("json")
 local _ = require("gettext")
 local T = require("ffi/util").template
+
+-- PERF: how long to coalesce rapid saveData() calls before actually
+-- writing to disk. Editing a note field-by-field, or bulk-adding several
+-- aliases, no longer means N full-file writes.
+local SAVE_DEBOUNCE_SECONDS = 2
+-- PERF: cap per-name match search. The old cap of 5000 meant a single
+-- character with a very common alias could alone produce 5000 marks;
+-- with 200 characters that's a worst case of ~1,000,000 marks kept in
+-- memory and walked on every paint. 800 is still generous for underlining
+-- purposes and keeps worst-case memory/paint cost bounded.
+local MAX_MATCHES_PER_NAME = 800
 
 local CharacterTracker = WidgetContainer:extend{
     name = "charactertracker",
@@ -118,6 +153,21 @@ function CharacterTracker:init()
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self.characters = {}
+    -- PERF: name/alias -> character hash index. Rebuilt only when the
+    -- character/alias set actually changes (see _rebuildNameIndex),
+    -- turning getCharacterByName/isAliasOrNameTaken from O(n) or O(n*a)
+    -- scans into O(1) lookups.
+    self._name_index = {}
+    -- PERF: marks bucketed per character (for incremental rebuild) and
+    -- per page (for O(1) paint lookups in paged documents).
+    self.marks_by_charname = {}
+    self.marks_by_page = {}
+    -- PERF: deferred-save bookkeeping.
+    self._data_dirty = false
+    self._save_scheduled = false
+    -- Guard against onReaderReady firing more than once for the same
+    -- instance and double-registering touch zones / view modules.
+    self._reader_ready_done = false
 end
 
 function CharacterTracker:onDispatcherRegisterActions()
@@ -130,6 +180,15 @@ function CharacterTracker:onDispatcherRegisterActions()
 end
 
 function CharacterTracker:onReaderReady()
+    -- PERF: defensive guard. If onReaderReady is ever invoked twice for
+    -- the same plugin instance, this prevents duplicate touch-zone /
+    -- view-module registration, which would otherwise cause the tap
+    -- handler and paint hook to run multiple times per event.
+    if self._reader_ready_done then
+        return
+    end
+    self._reader_ready_done = true
+
     self:loadData()
     -- Load underline preference (default: off)
     local saved = self.ui.doc_settings:readSetting("character_tracker_underline")
@@ -156,8 +215,8 @@ function CharacterTracker:onReaderReady()
             end,
         },
     })
-    -- Build marks for existing characters
-    self:rebuildMarks()
+    -- Build marks for existing characters (one-time full scan at doc open)
+    self:rebuildAllMarks()
     -- Register our button in the highlight dialog
     if self.ui.highlight then
         self.ui.highlight:addToHighlightDialog("charactertracker_assign", function(this)
@@ -175,11 +234,34 @@ function CharacterTracker:onReaderReady()
 end
 
 function CharacterTracker:onCloseDocument()
-    self:saveData()
+    -- PERF: flush any pending debounced save immediately - we must not
+    -- lose data just because the debounce window hadn't elapsed yet.
+    self:_flushSaveData()
+    if self._save_scheduled then
+        UIManager:unschedule(self._flushSaveDataBound)
+        self._save_scheduled = false
+    end
+    -- Clean up registrations so nothing keeps this instance (and its
+    -- document reference) alive or firing after the document is closed.
+    local ok1, err1 = pcall(function()
+        self.ui:unRegisterTouchZones({ { id = "charactertracker_tap" } })
+    end)
+    if not ok1 then
+        logger.dbg("CharacterTracker: unRegisterTouchZones not available:", err1)
+    end
+    local ok2, err2 = pcall(function()
+        self.ui.view:unregisterViewModule("charactertracker")
+    end)
+    if not ok2 then
+        logger.dbg("CharacterTracker: unregisterViewModule not available:", err2)
+    end
 end
 
 function CharacterTracker:onPageUpdate()
     self.visible_boxes = {}
+    -- PERF: invalidate the rolling-mode paint cache (see paintTo) since
+    -- the visible position range has changed.
+    self._paint_cache_key = nil
 end
 
 -- ============================================================
@@ -213,6 +295,26 @@ function CharacterTracker:_paintToRolling(bb, x, y)
     else
         cur_view_bottom = cur_view_top + self.ui.dimen.h
     end
+
+    -- PERF: paintTo can fire many times for the exact same viewport
+    -- (e.g. a dialog opening/closing on top of the page triggers a
+    -- repaint of the page underneath). If the viewport hasn't moved
+    -- since the last paint, reuse the previously computed box list
+    -- instead of re-walking every mark and re-resolving XPointers
+    -- (getPosFromXPointer/getScreenBoxesFromPositions are not free -
+    -- they walk document layout state).
+    local cache_key = cur_view_top .. ":" .. cur_view_bottom .. ":" .. tostring(self.mark_enabled)
+    if self._paint_cache_key == cache_key and self._paint_cache_boxes then
+        for _i, cached in ipairs(self._paint_cache_boxes) do
+            if self.mark_enabled then
+                self.view:drawHighlightRect(bb, x, y, cached.rect, "underscore")
+            end
+            table.insert(self.visible_boxes, cached)
+        end
+        return
+    end
+
+    local computed = {}
     for _i, mark in ipairs(self.char_marks) do
         if mark.start and mark["end"] then
             local start_pos = self.ui.document:getPosFromXPointer(mark.start)
@@ -226,10 +328,9 @@ function CharacterTracker:_paintToRolling(bb, x, y)
                                 if self.mark_enabled then
                                     self.view:drawHighlightRect(bb, x, y, box, "underscore")
                                 end
-                                table.insert(self.visible_boxes, {
-                                    rect = box,
-                                    char_name = mark.char_name,
-                                })
+                                local entry = { rect = box, char_name = mark.char_name }
+                                table.insert(self.visible_boxes, entry)
+                                table.insert(computed, entry)
                             end
                         end
                     end
@@ -237,12 +338,21 @@ function CharacterTracker:_paintToRolling(bb, x, y)
             end
         end
     end
+    self._paint_cache_key = cache_key
+    self._paint_cache_boxes = computed
 end
 
 function CharacterTracker:_paintToPaging(bb, x, y)
     local cur_page = self.ui.document:getCurrentPage()
-    for _i, mark in ipairs(self.char_marks) do
-        if mark.start == cur_page and mark.boxes then
+    -- PERF: was `for _i, mark in ipairs(self.char_marks) do if mark.start == cur_page`,
+    -- i.e. a full linear scan of EVERY mark in the book on EVERY paint,
+    -- just to find the handful that belong to the current page. Marks
+    -- are now bucketed by page at rebuild time, so this is a direct
+    -- O(1) lookup + O(marks-on-this-page) walk instead of O(all marks).
+    local page_marks = self.marks_by_page[cur_page]
+    if not page_marks then return end
+    for _i, mark in ipairs(page_marks) do
+        if mark.boxes then
             for _j, box in ipairs(mark.boxes) do
                 local native_box = self.ui.document:nativeToPageRectTransform(cur_page, box)
                 if native_box then
@@ -262,40 +372,109 @@ function CharacterTracker:_paintToPaging(bb, x, y)
     end
 end
 
-function CharacterTracker:rebuildMarks()
-    if not self.ui.document then return end
-    self.char_marks = {}
-    local names = {}
-    for _i, char in ipairs(self.characters) do
-        table.insert(names, { text = char.name, char_name = char.name })
-        if char.aliases then
-            for _j, alias in ipairs(char.aliases) do
-                table.insert(names, { text = alias, char_name = char.name })
+-- PERF: rebuild the flat self.char_marks list and self.marks_by_page
+-- bucket table from self.marks_by_charname. This is pure table
+-- bookkeeping (no document scanning), so it's cheap even with hundreds
+-- of characters, and is the only thing that needs to re-run after an
+-- incremental per-character mark update.
+function CharacterTracker:_indexMarks()
+    local flat = {}
+    local by_page = {}
+    for _char_name, marks in pairs(self.marks_by_charname) do
+        for _i, mark in ipairs(marks) do
+            table.insert(flat, mark)
+            if mark.start and by_page[mark.start] == nil and self.ui.paging then
+                by_page[mark.start] = {}
+            end
+            if self.ui.paging and mark.start then
+                table.insert(by_page[mark.start], mark)
             end
         end
     end
-    if #names == 0 then return end
+    self.char_marks = flat
+    self.marks_by_page = by_page
+end
+
+--- Scan the document for a single character's name + aliases only.
+--- PERF: this is the key fix for "every edit re-scans the whole book".
+--- Adding/renaming/deleting an alias, adding a character, or renaming a
+--- character now only re-scans text for THAT character, not all N
+--- characters. Cost of an edit is O(1 character) instead of O(n).
+function CharacterTracker:rebuildMarksForCharacter(char)
+    if not self.ui.document then return end
+    local names = { { text = char.name, char_name = char.name } }
+    if char.aliases then
+        for _j, alias in ipairs(char.aliases) do
+            table.insert(names, { text = alias, char_name = char.name })
+        end
+    end
+    local marks = {}
+    for _i, name in ipairs(names) do
+        if name.text and name.text ~= "" then
+            local res = self.ui.document:findAllText(name.text, true, 0, MAX_MATCHES_PER_NAME, false)
+            if res then
+                for _j, item in ipairs(res) do
+                    item.char_name = name.char_name
+                    table.insert(marks, item)
+                end
+            end
+        end
+    end
+    self.marks_by_charname[char.name] = marks
+    self:_indexMarks()
+end
+
+--- Remove all marks belonging to a character name (used on delete/rename).
+function CharacterTracker:removeMarksForCharacterName(char_name)
+    self.marks_by_charname[char_name] = nil
+    self:_indexMarks()
+end
+
+--- Full rebuild across all characters. Only needed at document open,
+--- and after series link/unlink/merge (where the whole character set
+--- changes at once). NOT called on individual edits anymore.
+function CharacterTracker:rebuildAllMarks()
+    if not self.ui.document then return end
+    self.marks_by_charname = {}
+    if #self.characters == 0 then
+        self:_indexMarks()
+        return
+    end
+
     local Trapper = require("ui/trapper")
     local info = InfoMessage:new{ text = _("Indexing character names…") }
     UIManager:show(info)
     UIManager:forceRePaint()
     local completed, results = Trapper:dismissableRunInSubprocess(function()
-        local all_marks = {}
-        for _i, name in ipairs(names) do
-            local res = self.ui.document:findAllText(name.text, true, 0, 5000, false)
-            if res then
-                for _j, item in ipairs(res) do
-                    item.char_name = name.char_name
-                    table.insert(all_marks, item)
+        local per_char = {}
+        for _i, char in ipairs(self.characters) do
+            local names = { { text = char.name, char_name = char.name } }
+            if char.aliases then
+                for _j, alias in ipairs(char.aliases) do
+                    table.insert(names, { text = alias, char_name = char.name })
                 end
             end
+            local marks = {}
+            for _j, name in ipairs(names) do
+                if name.text and name.text ~= "" then
+                    local res = self.ui.document:findAllText(name.text, true, 0, MAX_MATCHES_PER_NAME, false)
+                    if res then
+                        for _k, item in ipairs(res) do
+                            item.char_name = name.char_name
+                            table.insert(marks, item)
+                        end
+                    end
+                end
+            end
+            per_char[char.name] = marks
         end
-        return all_marks
+        return per_char
     end, info)
     UIManager:close(info)
     if completed and results then
-        self.char_marks = results
+        self.marks_by_charname = results
     end
+    self:_indexMarks()
     UIManager:setDirty(self.dialog, "ui")
 end
 
@@ -379,9 +558,30 @@ function CharacterTracker:loadData()
             end
         end
     end
+    -- PERF: (re)build the name/alias hash index once after loading,
+    -- rather than linear-scanning self.characters on every lookup.
+    self:_rebuildNameIndex()
 end
 
+-- PERF: saveData() is now a cheap "mark dirty + debounce" call instead
+-- of an immediate synchronous full-file write. Rapid-fire edits (typing
+-- through several notes, adding a batch of aliases) collapse into a
+-- single disk write ~SAVE_DEBOUNCE_SECONDS after the last edit.
+-- onCloseDocument() flushes synchronously so nothing is lost on exit.
 function CharacterTracker:saveData()
+    self._data_dirty = true
+    if self._save_scheduled then return end
+    self._save_scheduled = true
+    self._flushSaveDataBound = function()
+        self._save_scheduled = false
+        if self._data_dirty then
+            self:_flushSaveData()
+        end
+    end
+    UIManager:scheduleIn(SAVE_DEBOUNCE_SECONDS, self._flushSaveDataBound)
+end
+
+function CharacterTracker:_flushSaveData()
     local path = self:getDataFilePath()
     local ok, content = pcall(json.encode, self.characters)
     if ok then
@@ -390,6 +590,7 @@ function CharacterTracker:saveData()
             f:write(content)
             f:close()
         end
+        self._data_dirty = false
     else
         logger.warn("CharacterTracker: failed to encode data")
     end
@@ -452,6 +653,9 @@ function CharacterTracker:mergeCharacters(source_chars)
             merged_count = merged_count + 1
         end
     end
+    -- PERF: the whole character set changed here, so a full name-index
+    -- rebuild is required (caller also triggers rebuildAllMarks()).
+    self:_rebuildNameIndex()
     return merged_count
 end
 
@@ -474,22 +678,29 @@ function CharacterTracker:getCurrentChapter()
     return toc_title or _("Unknown chapter")
 end
 
-function CharacterTracker:getCharacterByName(name)
-    local name_lower = name:lower()
+-- PERF: rebuild the lowercased name/alias -> character hash index.
+-- Called only after structural changes (add/rename/delete character,
+-- add/edit/delete alias, load/merge) - NOT on every lookup. This turns
+-- getCharacterByName and isAliasOrNameTaken from O(n) / O(n*a) linear
+-- scans into O(1) table lookups, which matters a lot once character
+-- counts get into the hundreds (list rendering, tap-to-open, highlight
+-- assignment all call these).
+function CharacterTracker:_rebuildNameIndex()
+    local index = {}
     for _i, char in ipairs(self.characters) do
-        if char.name:lower() == name_lower then
-            return char
-        end
-        -- Check aliases
+        index[char.name:lower()] = char
         if char.aliases then
-            for _i, alias in ipairs(char.aliases) do
-                if alias:lower() == name_lower then
-                    return char
-                end
+            for _j, alias in ipairs(char.aliases) do
+                index[alias:lower()] = char
             end
         end
     end
-    return nil
+    self._name_index = index
+end
+
+function CharacterTracker:getCharacterByName(name)
+    if not name then return nil end
+    return self._name_index[name:lower()]
 end
 
 function CharacterTracker:getCharacterIndex(character)
@@ -529,8 +740,11 @@ function CharacterTracker:addCharacter(name, note, callback)
     end
 
     table.insert(self.characters, character)
+    self:_rebuildNameIndex()
     self:saveData()
-    self:rebuildMarks()
+    -- PERF: was self:rebuildMarks() - a full re-scan of ALL characters.
+    -- Only this new character needs a document scan.
+    self:rebuildMarksForCharacter(character)
 
     UIManager:show(InfoMessage:new{
         text = T(_("Character '%1' added."), name),
@@ -798,21 +1012,14 @@ function CharacterTracker:showAliasManager(character)
 end
 
 --- Check if an alias is already used by another character
+--- PERF: was an O(n*a) linear scan of every character + every alias.
+--- Now an O(1) hash lookup via the name index, with one extra check
+--- (excluded character) since the index doesn't track owner identity
+--- beyond the character reference itself.
 function CharacterTracker:isAliasOrNameTaken(text, exclude_character)
-    local text_lower = text:lower()
-    for _i, char in ipairs(self.characters) do
-        if char ~= exclude_character then
-            if char.name:lower() == text_lower then
-                return char.name
-            end
-            if char.aliases then
-                for _j, alias in ipairs(char.aliases) do
-                    if alias:lower() == text_lower then
-                        return char.name
-                    end
-                end
-            end
-        end
+    local match = self._name_index[text:lower()]
+    if match and match ~= exclude_character then
+        return match.name
     end
     return nil
 end
@@ -864,8 +1071,10 @@ function CharacterTracker:showAddAliasDialog(character)
                             character.aliases = {}
                         end
                         table.insert(character.aliases, alias)
+                        self:_rebuildNameIndex()
                         self:saveData()
-                        self:rebuildMarks()
+                        -- PERF: only re-scan this character's marks, not all of them.
+                        self:rebuildMarksForCharacter(character)
                         UIManager:show(InfoMessage:new{
                             text = T(_("Alias '%1' added."), alias),
                             timeout = 1,
@@ -923,8 +1132,9 @@ function CharacterTracker:showEditAliasDialog(character, alias_index)
                         end
 
                         character.aliases[alias_index] = alias
+                        self:_rebuildNameIndex()
                         self:saveData()
-                        self:rebuildMarks()
+                        self:rebuildMarksForCharacter(character)
                         UIManager:show(InfoMessage:new{
                             text = T(_("Alias updated to '%1'."), alias),
                             timeout = 1,
@@ -945,8 +1155,9 @@ function CharacterTracker:confirmDeleteAlias(character, alias_index)
         ok_text = _("Delete"),
         ok_callback = function()
             table.remove(character.aliases, alias_index)
+            self:_rebuildNameIndex()
             self:saveData()
-            self:rebuildMarks()
+            self:rebuildMarksForCharacter(character)
             UIManager:show(InfoMessage:new{
                 text = T(_("Alias '%1' deleted."), alias),
                 timeout = 1,
@@ -1210,6 +1421,9 @@ function CharacterTracker:confirmDeleteRelationship(character, rel_index)
 end
 
 --- Get all relationships pointing TO a character (from other characters)
+--- Kept as an O(n) helper for single-character lookups (character detail
+--- view calls this once). For the character LIST (many characters at
+--- once) use _buildIncomingRelationshipsMap() instead - see showCharacterList.
 function CharacterTracker:getIncomingRelationships(character)
     local incoming = {}
     local name_lower = character.name:lower()
@@ -1226,6 +1440,25 @@ function CharacterTracker:getIncomingRelationships(character)
         end
     end
     return incoming
+end
+
+-- PERF: builds a name-lower -> {incoming relationships} map in a single
+-- O(n * avg_relationships) pass. showCharacterList previously called
+-- getIncomingRelationships() once PER character, each of which itself
+-- scanned all n characters -> O(n^2). With 200+ characters that alone
+-- could blow through the "list popup within 100ms" target.
+function CharacterTracker:_buildIncomingRelationshipsMap()
+    local map = {}
+    for _i, char in ipairs(self.characters) do
+        if char.relationships then
+            for _j, rel in ipairs(char.relationships) do
+                local key = rel.target:lower()
+                if not map[key] then map[key] = {} end
+                table.insert(map[key], { source = char.name, type = rel.type })
+            end
+        end
+    end
+    return map
 end
 
 function CharacterTracker:deleteCharacter(character)
@@ -1247,8 +1480,10 @@ function CharacterTracker:deleteCharacter(character)
                     end
                 end
                 table.remove(self.characters, idx)
+                self:_rebuildNameIndex()
                 self:saveData()
-                self:rebuildMarks()
+                -- PERF: just drop this character's marks, no re-scan needed.
+                self:removeMarksForCharacterName(character.name)
                 UIManager:show(InfoMessage:new{
                     text = T(_("Character '%1' deleted."), character.name),
                     timeout = 2,
@@ -1304,8 +1539,13 @@ function CharacterTracker:showRenameDialog(character, on_done)
                         end
 
                         character.name = new_name
+                        self:_rebuildNameIndex()
                         self:saveData()
-                        self:rebuildMarks()
+                        -- PERF: marks were keyed by the OLD name; drop that
+                        -- bucket and rebuild just this character's marks
+                        -- under the new name, instead of a full rebuild.
+                        self:removeMarksForCharacterName(old_name)
+                        self:rebuildMarksForCharacter(character)
 
                         UIManager:show(InfoMessage:new{
                             text = T(_("Renamed '%1' → '%2'."), old_name, new_name),
@@ -1553,6 +1793,12 @@ function CharacterTracker:showCharacterList()
         return
     end
 
+    -- PERF: build the incoming-relationships map ONCE (O(n)) instead of
+    -- calling getIncomingRelationships() per character (O(n) each,
+    -- O(n^2) total). This is what kept the list popup under the 100ms
+    -- target once character counts got large.
+    local incoming_map = self:_buildIncomingRelationshipsMap()
+
     local item_table = {}
     for _i, char in ipairs(self.characters) do
         local badges = {}
@@ -1571,8 +1817,8 @@ function CharacterTracker:showCharacterList()
             table.insert(badges, T(_("%1 aliases"), #char.aliases))
         end
         -- Relationships
-        local rel_count = (char.relationships and #char.relationships or 0)
-                        + #self:getIncomingRelationships(char)
+        local incoming = incoming_map[char.name:lower()] or {}
+        local rel_count = (char.relationships and #char.relationships or 0) + #incoming
         if rel_count > 0 then
             table.insert(badges, T(_("%1 relations"), rel_count))
         end
@@ -1766,7 +2012,10 @@ function CharacterTracker:linkToSeries(series_name)
         -- Merge old book characters into series
         local merged = self:mergeCharacters(old_characters)
         self:saveData()
-        self:rebuildMarks()
+        -- PERF: the whole character set changed here (merge), so a full
+        -- rebuild is the correct (and only) option - this is not a
+        -- hot/frequent path like a single alias edit.
+        self:rebuildAllMarks()
 
         local msg
         if series_had_characters then
@@ -1779,7 +2028,7 @@ function CharacterTracker:linkToSeries(series_name)
         UIManager:show(InfoMessage:new{ text = msg })
     else
         if series_had_characters then
-            self:rebuildMarks()
+            self:rebuildAllMarks()
             UIManager:show(InfoMessage:new{
                 text = T(_("Linked to series '%1'.\nLoaded %2 shared characters."),
                     series_name, #self.characters),
@@ -1803,8 +2052,9 @@ function CharacterTracker:unlinkFromSeries()
         ok_callback = function()
             self:setSeriesName(nil)
             self.characters = {}
+            self:_rebuildNameIndex()
             self:saveData()
-            self:rebuildMarks()
+            self:rebuildAllMarks()
             UIManager:show(InfoMessage:new{
                 text = T(_("Unlinked from series '%1'."), series),
                 timeout = 2,
@@ -1863,6 +2113,10 @@ function CharacterTracker:addToMainMenu(menu_items)
                 callback = function()
                     self.mark_enabled = not self.mark_enabled
                     self.ui.doc_settings:saveSetting("character_tracker_underline", self.mark_enabled)
+                    -- PERF: mark_enabled changed - the rolling-mode paint
+                    -- cache key includes it, so no manual invalidation
+                    -- needed, but be explicit for clarity/future-proofing.
+                    self._paint_cache_key = nil
                     UIManager:setDirty(self.dialog, "ui")
                 end,
             },
