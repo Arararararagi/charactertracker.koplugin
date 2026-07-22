@@ -145,14 +145,6 @@ The format is plain JSON — easy to back up, version-control, or edit by hand.
 ---
 
 ## File structure
->>>>>>> REPLACE</absolutePath>
-<task_progress>
-- [x] Analyze requirements
-- [x] Locate and verify main.lua
-- [x] Stage changes
-- [x] Commit with documentation
-- [x] Push to remote
-- [x] Update README if necessary
 
 ```
 charactertracker.koplugin/
