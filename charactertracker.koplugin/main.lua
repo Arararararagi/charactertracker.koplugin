@@ -422,12 +422,21 @@ function CharacterTracker:rebuildMarksForCharacter(char)
     end
     self.marks_by_charname[char.name] = marks
     self:_indexMarks()
+    -- PERF/BUGFIX: without this, the screen is never told to repaint
+    -- after an incremental mark update. paintTo() is both what draws
+    -- the underline AND what populates self.visible_boxes (used by the
+    -- tap handler) - so skipping this meant new/changed names appeared
+    -- un-underlined and untappable until some unrelated repaint (e.g.
+    -- a page turn) happened to run paintTo again. rebuildAllMarks() had
+    -- this call already; the incremental path needs it too.
+    UIManager:setDirty(self.dialog, "ui")
 end
 
 --- Remove all marks belonging to a character name (used on delete/rename).
 function CharacterTracker:removeMarksForCharacterName(char_name)
     self.marks_by_charname[char_name] = nil
     self:_indexMarks()
+    UIManager:setDirty(self.dialog, "ui")
 end
 
 --- Full rebuild across all characters. Only needed at document open,
