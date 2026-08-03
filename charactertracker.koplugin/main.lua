@@ -735,6 +735,53 @@ function CharacterTracker:getCurrentChapter()
     return toc_title or _("Unknown chapter")
 end
 
+--- Derive reading-location stats for a character from its marks.
+--- PERF: pure table walk plus at most two FFI calls (rolling docs only);
+--- computed at view time, never persisted.
+function CharacterTracker:getCharacterAppearance(character)
+    local marks = self.marks_by_charname[character.name]
+    if not marks or #marks == 0 then
+        return { count = 0 }
+    end
+    local count = #marks
+    local first_page, last_page
+    if self.ui.paging then
+        -- Kopt marks carry start = page number; compute min/max in one pass.
+        for _i, mark in ipairs(marks) do
+            if mark.start then
+                if not first_page or mark.start < first_page then
+                    first_page = mark.start
+                end
+                if not last_page or mark.start > last_page then
+                    last_page = mark.start
+                end
+            end
+        end
+    elseif self.ui.rolling and self.ui.document.getPageFromXPointer then
+        -- findAllText returns results in document order, so the first and
+        -- last marks bound the character's span in the book.
+        local ok1, f = pcall(function()
+            return self.ui.document:getPageFromXPointer(marks[1].start)
+        end)
+        if ok1 and f then first_page = f end
+        local last = marks[#marks]
+        local ok2, l
+        if last and last["end"] then
+            ok2, l = pcall(function()
+                return self.ui.document:getPageFromXPointer(last["end"])
+            end)
+        end
+        if ok2 and l then last_page = l end
+    end
+    return {
+        count = count,
+        first_page = first_page,
+        last_page = last_page,
+        first_chapter = first_page and self.ui.toc:getTocTitleByPage(first_page) or nil,
+        last_chapter = last_page and self.ui.toc:getTocTitleByPage(last_page) or nil,
+    }
+end
+
 -- PERF: rebuild the lowercased name/alias -> character hash index.
 -- Called only after structural changes (add/rename/delete character,
 -- add/edit/delete alias, load/merge) - NOT on every lookup. This turns
@@ -1716,6 +1763,32 @@ function CharacterTracker:showCharacterDetail(character)
     -- Role
     table.insert(text_parts, "  " .. _("Role") .. ":    " .. getRoleLabel(character.role) .. "\n")
 
+    -- Appearance stats (derived on demand from the mark index)
+    if self.mark_enabled then
+        local app = self:getCharacterAppearance(character)
+        table.insert(text_parts, "  " .. _("Occurrences") .. ": " .. app.count .. "\n")
+        local seen = {}
+        if app.first_page then
+            if app.first_chapter and app.first_chapter ~= _("Unknown chapter") then
+                table.insert(seen, T(_("first: %1 (p. %2)"), app.first_chapter, app.first_page))
+            else
+                table.insert(seen, T(_("first: p. %1"), app.first_page))
+            end
+        end
+        if app.last_page then
+            if app.last_chapter and app.last_chapter ~= _("Unknown chapter") then
+                table.insert(seen, T(_("last: %1 (p. %2)"), app.last_chapter, app.last_page))
+            else
+                table.insert(seen, T(_("last: p. %1"), app.last_page))
+            end
+        end
+        if #seen > 0 then
+            table.insert(text_parts, "  " .. table.concat(seen, " · ") .. "\n")
+        end
+    else
+        table.insert(text_parts, "  " .. _("Occurrences") .. ": " .. _("n/a (enable underlining to index)") .. "\n")
+    end
+
     -- Aliases
     if character.aliases and #character.aliases > 0 then
         table.insert(text_parts, "  " .. _("Aliases") .. ": " .. table.concat(character.aliases, ", ") .. "\n")
@@ -1882,6 +1955,13 @@ function CharacterTracker:showCharacterList()
         -- Counts
         if char.notes and #char.notes > 0 then
             table.insert(badges, T(_("%1 notes"), #char.notes))
+        end
+        -- Occurrence count (derived; only meaningful while indexing is on)
+        if self.mark_enabled and self.marks_by_charname[char.name] then
+            local hit_count = #self.marks_by_charname[char.name]
+            if hit_count > 0 then
+                table.insert(badges, T(_("%1 hits"), hit_count))
+            end
         end
         local info = ""
         if #badges > 0 then
