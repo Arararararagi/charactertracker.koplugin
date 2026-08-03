@@ -14,6 +14,9 @@ Never forget who's who in a long novel — or across an entire series — again.
 - **Rating** — rate characters from ★ to ★★★★★.
 - **Role** — tag as Main, Secondary, Tertiary, Mentioned, Antagonist, or Narrator.
 - **Rename** — safely rename a character (relationships pointing to it are updated automatically).
+- **Quick-add a note** straight from the detail view.
+- **Pin** characters to the top of the list; **sort** by name, rating, role, or date added.
+- **Search** characters by name or alias from the Tools menu.
 
 ### Relationships
 - Link characters with predefined types: **father, mother, son, daughter, brother, sister, spouse, ally, enemy, friend, mentor, servant, master, lover**.
@@ -24,9 +27,16 @@ Never forget who's who in a long novel — or across an entire series — again.
 
 ### In-text recognition
 - **Underline character names** in the page (toggle in the menu).
-  Names and aliases are indexed in the background using KOReader's `findAllText`.
+  Names and aliases are indexed using KOReader's `findAllText`.
 - **Tap any underlined name** to open that character's detail view instantly.
 - Re-indexes automatically when characters or aliases are added/edited.
+- Indexing only runs while the toggle is **on**: turning it off frees all mark
+  memory and disables tap-to-open; turning it on lazily rebuilds the index.
+- **Max matches per name** (400/800/1600) bounds the per-name scan cost.
+- **Per-character underline opt-out**: hide a character's underlines (and make
+  them untappable) without deleting it — toggle from its detail view.
+- The detail view shows **occurrence count** and **first/last appearance**
+  (page + chapter), derived from the index.
 
 ### Highlight integration
 - Adds a **Character** button to the highlight popup.
@@ -40,6 +50,15 @@ Never forget who's who in a long novel — or across an entire series — again.
 - **Unlink** at any time — the series file is preserved.
 - Manage and **delete** series from the link dialog.
 - Perfect for *A Song of Ice and Fire*, *The Wheel of Time*, *Discworld*, etc.
+- **Search characters across all series** from the Tools menu to answer
+  "which book does this character appear in?".
+
+### Backup & safety
+- **Export** the current character set to a named JSON file under
+  `<koreader-data>/character_tracker/exports/`, and **import** any such file
+  (same-name characters are merged, never duplicated).
+- **Undo last delete** restores the most recently deleted character within the
+  session — including its relationships — from an in-memory undo stack.
 
 ---
 
@@ -121,8 +140,11 @@ The plugin is designed to stay responsive during long reading sessions
   version instead of a full-book rescan.
 - `showCharacterList` builds an incoming-relationships map once
   (`_buildIncomingRelationshipsMap`, O(n)) instead of O(n²) per character.
-- `findAllText` match cap lowered from 5000 to 800 per name to bound
-  worst-case mark count and memory.
+- `findAllText` match cap bounds worst-case mark count and memory; it is
+  configurable via **Max matches per name** (default 800).
+- Indexing is fully gated by the **Underline names in text** toggle: when it is
+  off no scan runs at document open and all mark tables are freed, so turning
+  it on lazily rebuilds the index only when needed.
 
 ### Storage batching
 - `saveData` marks dirty and schedules a debounced write

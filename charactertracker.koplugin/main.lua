@@ -2073,6 +2073,24 @@ function CharacterTracker:showCharacterDetail(character)
             },
             {
                 {
+                    text = _("＋ Note"),
+                    callback = function()
+                        UIManager:close(viewer)
+                        self:showAddNoteDialog(character)
+                    end,
+                },
+                {
+                    text = character.pinned == true and _("Unpin") or _("Pin"),
+                    callback = function()
+                        UIManager:close(viewer)
+                        character.pinned = not (character.pinned == true)
+                        self:saveData()
+                        self:showCharacterDetail(character)
+                    end,
+                },
+            },
+            {
+                {
                     text = _("Rename"),
                     callback = function()
                         UIManager:close(viewer)
@@ -2109,12 +2127,64 @@ function CharacterTracker:onShowCharacterList()
     self:showCharacterList()
 end
 
-function CharacterTracker:showCharacterList()
+function CharacterTracker:showCharacterList(filter, sort_mode)
     if not self.characters or #self.characters == 0 then
         UIManager:show(InfoMessage:new{
             text = _("No characters tracked yet.\n\nTo add a character:\n1. Select text in the book\n2. Tap 'Character' in the highlight menu\n3. Or use the Tools menu → Character Tracker → Add character"),
         })
         return
+    end
+
+    -- Optional substring filter (lowercased) over name + aliases.
+    filter = filter and filter ~= "" and filter:lower() or nil
+
+    local chars = {}
+    if filter then
+        for _i, char in ipairs(self.characters) do
+            if self:characterMatchesQuery(char, filter) then
+                table.insert(chars, char)
+            end
+        end
+        if #chars == 0 then
+            UIManager:show(InfoMessage:new{
+                text = T(_("No characters match '%1'."), filter),
+            })
+            return
+        end
+    else
+        for _i, char in ipairs(self.characters) do
+            table.insert(chars, char)
+        end
+    end
+
+    -- Sort (pinned first, then by the chosen mode). Computed at list-open
+    -- time only; session-local preference in self._sort_mode.
+    sort_mode = sort_mode or self._sort_mode or "default"
+    local sort_fns = {
+        name = function(a, b) return a.name:lower() < b.name:lower() end,
+        rating = function(a, b)
+            local ra, rb = a.rating or 0, b.rating or 0
+            if ra ~= rb then return ra > rb end
+            return a.name:lower() < b.name:lower()
+        end,
+        role = function(a, b)
+            local ra, rb = getRoleLabel(a.role or ""), getRoleLabel(b.role or "")
+            if ra ~= rb then return ra < rb end
+            return a.name:lower() < b.name:lower()
+        end,
+        created = function(a, b)
+            local ca, cb = a.created or "", b.created or ""
+            if ca ~= cb then return ca < cb end
+            return a.name:lower() < b.name:lower()
+        end,
+    }
+    local cmp = sort_fns[sort_mode]
+    if cmp then
+        table.sort(chars, function(a, b)
+            local pa, pb = a.pinned == true, b.pinned == true
+            if pa ~= pb then return pa end
+            return cmp(a, b)
+        end)
     end
 
     -- PERF: build the incoming-relationships map ONCE (O(n)) instead of
@@ -2124,7 +2194,7 @@ function CharacterTracker:showCharacterList()
     local incoming_map = self:_buildIncomingRelationshipsMap()
 
     local item_table = {}
-    for _i, char in ipairs(self.characters) do
+    for _i, char in ipairs(chars) do
         local badges = {}
         -- Stars
         local rating = char.rating or 0
@@ -2180,7 +2250,7 @@ function CharacterTracker:showCharacterList()
     local menu_container
     local menu
     menu = Menu:new{
-        title = _("Characters"),
+        title = filter and T(_("Characters matching '%1' (%2)"), filter, #chars) or _("Characters"),
         item_table = item_table,
         is_borderless = true,
         is_popout = false,
@@ -2546,6 +2616,84 @@ end
 -- MENU REGISTRATION
 -- ============================================================
 
+function CharacterTracker:showCharacterSearch()
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Search characters"),
+        input_hint = _("Name or alias"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local q = dialog:getInputText():match("^%s*(.-)%s*$")
+                        UIManager:close(dialog)
+                        if q == "" then
+                            self:showCharacterList()
+                        else
+                            self:showCharacterList(q)
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function CharacterTracker:showCharacterSortDialog()
+    local current = self._sort_mode or "default"
+    local modes = {
+        { key = "default", label = _("Default (added order)") },
+        { key = "name", label = _("Name (A-Z)") },
+        { key = "rating", label = _("Rating") },
+        { key = "role", label = _("Role") },
+        { key = "created", label = _("Date added") },
+    }
+    local buttons = {}
+    for _i, m in ipairs(modes) do
+        local label = m.label
+        if current == m.key then
+            label = "✓ " .. label
+        end
+        table.insert(buttons, {
+            {
+                text = label,
+                callback = function()
+                    UIManager:close(self._sort_dialog)
+                    self._sort_dialog = nil
+                    self._sort_mode = m.key == "default" and nil or m.key
+                    self:showCharacterList()
+                end,
+            },
+        })
+    end
+    table.insert(buttons, {
+        {
+            text = _("Close"),
+            id = "close",
+            callback = function()
+                UIManager:close(self._sort_dialog)
+                self._sort_dialog = nil
+            end,
+        },
+    })
+    self._sort_dialog = ButtonDialog:new{
+        title = _("Sort characters"),
+        buttons = buttons,
+    }
+    UIManager:show(self._sort_dialog)
+end
+
 function CharacterTracker:showMatchCapDialog()
     local current = self:getMatchCap()
     local buttons = {}
@@ -2601,6 +2749,20 @@ function CharacterTracker:addToMainMenu(menu_items)
                 keep_menu_open = false,
                 callback = function()
                     self:showCharacterList()
+                end,
+            },
+            {
+                text = _("Search characters"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showCharacterSearch()
+                end,
+            },
+            {
+                text = _("Sort characters"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showCharacterSortDialog()
                 end,
             },
             {
