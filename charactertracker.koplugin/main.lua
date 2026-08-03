@@ -171,6 +171,8 @@ function CharacterTracker:init()
     -- PERF: deferred-save bookkeeping.
     self._data_dirty = false
     self._save_scheduled = false
+    -- In-memory undo stack for deleted characters (session-only, capped).
+    self._trash = {}
     -- Guard against onReaderReady firing more than once for the same
     -- instance and double-registering touch zones / view modules.
     self._reader_ready_done = false
@@ -1707,28 +1709,70 @@ function CharacterTracker:deleteCharacter(character)
         ok_callback = function()
             local idx = self:getCharacterIndex(character)
             if idx then
-                -- Also clean up relationships pointing to this character
+                -- Snapshot the character and the incoming relationship
+                -- entries we are about to remove, so the delete can be
+                -- undone later in the session (see restoreLastDeleted).
+                local snapshot = {
+                    character = character,
+                    incoming = {},
+                }
                 local char_name_lower = character.name:lower()
                 for _i, char in ipairs(self.characters) do
                     if char.relationships then
                         for j = #char.relationships, 1, -1 do
                             if char.relationships[j].target:lower() == char_name_lower then
+                                table.insert(snapshot.incoming, {
+                                    char = char,
+                                    rel = char.relationships[j],
+                                })
                                 table.remove(char.relationships, j)
                             end
                         end
                     end
                 end
                 table.remove(self.characters, idx)
+                table.insert(self._trash, snapshot)
+                -- PERF: keep the in-memory undo stack bounded.
+                while #self._trash > 5 do
+                    table.remove(self._trash, 1)
+                end
                 self:_rebuildNameIndex()
                 self:saveData()
                 -- PERF: just drop this character's marks, no re-scan needed.
                 self:removeMarksForCharacterName(character.name)
                 UIManager:show(InfoMessage:new{
-                    text = T(_("Character '%1' deleted."), character.name),
-                    timeout = 2,
+                    text = T(_("Character '%1' deleted.\nUse 'Undo last delete' to restore."), character.name),
+                    timeout = 3,
                 })
             end
         end,
+    })
+end
+
+function CharacterTracker:restoreLastDeleted()
+    local snapshot = table.remove(self._trash)
+    if not snapshot then
+        UIManager:show(InfoMessage:new{
+            text = _("Nothing to restore."),
+        })
+        return
+    end
+    -- Re-insert the character (append at the end keeps things simple).
+    table.insert(self.characters, snapshot.character)
+    -- Restore relationships that pointed to this character.
+    for _i, entry in ipairs(snapshot.incoming) do
+        if entry.char.relationships then
+            table.insert(entry.char.relationships, entry.rel)
+        end
+    end
+    self:_rebuildNameIndex()
+    self:saveData()
+    if self.mark_enabled then
+        self:rebuildMarksForCharacter(snapshot.character)
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Restored character '%1'."), snapshot.character.name),
+        timeout = 2,
     })
 end
 
@@ -2618,6 +2662,13 @@ function CharacterTracker:addToMainMenu(menu_items)
                 keep_menu_open = false,
                 callback = function()
                     self:showImportDialog()
+                end,
+            },
+            {
+                text = _("Undo last delete"),
+                keep_menu_open = false,
+                callback = function()
+                    self:restoreLastDeleted()
                 end,
             },
             {
