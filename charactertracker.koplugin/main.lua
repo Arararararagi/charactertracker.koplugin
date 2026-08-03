@@ -606,6 +606,119 @@ function CharacterTracker:getDataFilePath()
     return self.data_file
 end
 
+function CharacterTracker:getExportsDir()
+    local dir = DataStorage:getDataDir() .. "/character_tracker/exports"
+    lfs.mkdir(dir)
+    return dir
+end
+
+function CharacterTracker:showExportDialog()
+    local default_name = self:getSeriesName()
+    if not default_name and self.ui.document and self.ui.document.file then
+        default_name = self.ui.document.file:match("([^/]+)%.%w+$") or "characters"
+    end
+    default_name = default_name or "characters"
+
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Export characters"),
+        input = default_name,
+        input_hint = _("Filename (saved under character_tracker/exports)"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Export"),
+                    is_enter_default = true,
+                    callback = function()
+                        local name = dialog:getInputText():match("^%s*(.-)%s*$")
+                        UIManager:close(dialog)
+                        if name == "" then return end
+                        local safe = name:gsub("[^%w%s%-_]", ""):gsub("%s+", "_")
+                        local path = self:getExportsDir() .. "/" .. safe .. ".json"
+                        local ok, content = pcall(json.encode, self.characters)
+                        if ok then
+                            local f = io.open(path, "w")
+                            if f then
+                                f:write(content)
+                                f:close()
+                                UIManager:show(InfoMessage:new{
+                                    text = T(_("Exported %1 characters to:\n%2"), #self.characters, path),
+                                    timeout = 3,
+                                })
+                            else
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Export failed: cannot write file."),
+                                })
+                            end
+                        else
+                            UIManager:show(InfoMessage:new{
+                                text = _("Export failed: could not encode data."),
+                            })
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function CharacterTracker:showImportDialog()
+    local plugin = self
+    local FileChooser = require("ui/widget/filechooser")
+    local chooser
+    chooser = FileChooser:new{
+        name = "charactertracker_import",
+        path = self:getExportsDir(),
+        show_parent = self.dialog,
+        close_callback = function()
+            UIManager:close(chooser)
+        end,
+        file_filter = function(filename)
+            return filename:match("%.json$") ~= nil
+        end,
+    }
+    function chooser:onFileSelect(item)
+        UIManager:close(chooser)
+        plugin:confirmImport(item.path)
+    end
+    UIManager:show(chooser)
+end
+
+function CharacterTracker:confirmImport(path)
+    local name = path:match("([^/]+)%.json$") or path
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Import characters from '%1'?\nCharacters with the same name will be merged."), name),
+        ok_text = _("Import"),
+        ok_callback = function()
+            local src = self:loadCharactersFromFile(path)
+            if #src == 0 then
+                UIManager:show(InfoMessage:new{
+                    text = _("No characters found in that file."),
+                })
+                return
+            end
+            local merged = self:mergeCharacters(src)
+            self:saveData()
+            if self.mark_enabled then
+                self:rebuildAllMarks()
+            end
+            UIManager:show(InfoMessage:new{
+                text = T(_("Imported %1 characters (%2 new)."), #src, merged),
+                timeout = 2,
+            })
+        end,
+    })
+end
+
 function CharacterTracker:loadData()
     self.characters = {}
     local path = self:getDataFilePath()
@@ -2491,6 +2604,20 @@ function CharacterTracker:addToMainMenu(menu_items)
                 keep_menu_open = false,
                 callback = function()
                     self:showSeriesCharacterSearch()
+                end,
+            },
+            {
+                text = _("Export characters"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showExportDialog()
+                end,
+            },
+            {
+                text = _("Import characters"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showImportDialog()
                 end,
             },
             {
