@@ -160,6 +160,10 @@ function CharacterTracker:init()
     -- turning getCharacterByName/isAliasOrNameTaken from O(n) or O(n*a)
     -- scans into O(1) lookups.
     self._name_index = {}
+    -- PERF: lowercased name/alias -> true set of characters that opted
+    -- out of underlining. Kept in sync with _name_index so the paint
+    -- loop can skip those marks with one table lookup.
+    self._no_underline_names = {}
     -- PERF: marks bucketed per character (for incremental rebuild) and
     -- per page (for O(1) paint lookups in paged documents).
     self.marks_by_charname = {}
@@ -322,10 +326,12 @@ function CharacterTracker:_paintToRolling(bb, x, y)
     local cache_key = cur_view_top .. ":" .. cur_view_bottom .. ":" .. tostring(self.mark_enabled)
     if self._paint_cache_key == cache_key and self._paint_cache_boxes then
         for _i, cached in ipairs(self._paint_cache_boxes) do
-            if self.mark_enabled then
-                self.view:drawHighlightRect(bb, x, y, cached.rect, "underscore")
+            if not self._no_underline_names[cached.char_name:lower()] then
+                if self.mark_enabled then
+                    self.view:drawHighlightRect(bb, x, y, cached.rect, "underscore")
+                end
+                table.insert(self.visible_boxes, cached)
             end
-            table.insert(self.visible_boxes, cached)
         end
         return
     end
@@ -339,8 +345,9 @@ function CharacterTracker:_paintToRolling(bb, x, y)
                 if end_pos and end_pos >= cur_view_top then
                     local boxes = self.ui.document:getScreenBoxesFromPositions(mark.start, mark["end"], true)
                     if boxes then
+                        local char_name_lower = mark.char_name:lower()
                         for _j, box in ipairs(boxes) do
-                            if box.h ~= 0 then
+                            if box.h ~= 0 and not self._no_underline_names[char_name_lower] then
                                 if self.mark_enabled then
                                     self.view:drawHighlightRect(bb, x, y, box, "underscore")
                                 end
@@ -376,7 +383,7 @@ function CharacterTracker:_paintToPaging(bb, x, y)
         -- { start = <page number>, boxes = {native rects}, ... } - there is
         -- no mark["end"] XPointer and no getScreenBoxesFromPositions here,
         -- so draw each native rect through the page->screen transforms.
-        if mark.boxes then
+        if mark.boxes and not self._no_underline_names[mark.char_name:lower()] then
             for _j, box in ipairs(mark.boxes) do
                 local native_box = self.ui.document:nativeToPageRectTransform(cur_page, box)
                 if native_box then
@@ -610,6 +617,12 @@ function CharacterTracker:loadData()
             local ok, data = pcall(json.decode, content)
             if ok and data then
                 self.characters = data
+                -- Normalize tolerant defaults for fields added after the
+                -- data was first written (underline opt-out, pinning).
+                for _i, char in ipairs(self.characters) do
+                    if char.underline == nil then char.underline = true end
+                    if char.pinned == nil then char.pinned = false end
+                end
             else
                 logger.warn("CharacterTracker: failed to parse", path)
             end
@@ -791,15 +804,23 @@ end
 -- assignment all call these).
 function CharacterTracker:_rebuildNameIndex()
     local index = {}
+    local no_underline = {}
     for _i, char in ipairs(self.characters) do
+        if char.underline == false then
+            no_underline[char.name:lower()] = true
+        end
         index[char.name:lower()] = char
         if char.aliases then
             for _j, alias in ipairs(char.aliases) do
+                if char.underline == false then
+                    no_underline[alias:lower()] = true
+                end
                 index[alias:lower()] = char
             end
         end
     end
     self._name_index = index
+    self._no_underline_names = no_underline
 end
 
 function CharacterTracker:getCharacterByName(name)
@@ -836,6 +857,7 @@ function CharacterTracker:addCharacter(name, note, callback)
         relationships = {},
         rating = 0,
         role = "",
+        underline = true,
         created = os.date("%Y-%m-%d %H:%M"),
     }
 
@@ -1874,6 +1896,21 @@ function CharacterTracker:showCharacterDetail(character)
                     callback = function()
                         UIManager:close(viewer)
                         self:showRelationshipManager(character)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Underline"),
+                    callback = function()
+                        UIManager:close(viewer)
+                        character.underline = not character.underline
+                        self:_rebuildNameIndex()
+                        -- PERF: refresh the rolling-mode paint cache so the
+                        -- opt-out takes effect immediately.
+                        self._paint_cache_key = nil
+                        self:saveData()
+                        self:showCharacterDetail(character)
                     end,
                 },
             },
