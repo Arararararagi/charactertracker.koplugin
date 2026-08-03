@@ -41,6 +41,7 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
+local G_reader_settings = require("luasettings").reader
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
@@ -62,7 +63,8 @@ local SAVE_DEBOUNCE_SECONDS = 2
 -- character with a very common alias could alone produce 5000 marks;
 -- with 200 characters that's a worst case of ~1,000,000 marks kept in
 -- memory and walked on every paint. 800 is still generous for underlining
--- purposes and keeps worst-case memory/paint cost bounded.
+-- purposes and keeps worst-case memory/paint cost bounded. This is the
+-- default for the G_reader_settings key "character_tracker_max_matches_per_name".
 local MAX_MATCHES_PER_NAME = 800
 
 local CharacterTracker = WidgetContainer:extend{
@@ -215,8 +217,19 @@ function CharacterTracker:onReaderReady()
             end,
         },
     })
-    -- Build marks for existing characters (one-time full scan at doc open)
-    self:rebuildAllMarks()
+    -- Build marks for existing characters (one-time full scan at doc open).
+    -- PERF: when underlining is off there is nothing to draw and no tap
+    -- targets (taps only fire on underlined names), so skip the full-book
+    -- findAllText scan entirely - that scan is the single most expensive
+    -- thing the plugin does at open time.
+    if self.mark_enabled then
+        self:rebuildAllMarks()
+    else
+        self.marks_by_charname = {}
+        self.marks_by_page = {}
+        self.char_marks = {}
+        self.visible_boxes = {}
+    end
     -- Register our button in the highlight dialog
     if self.ui.highlight then
         self.ui.highlight:addToHighlightDialog("charactertracker_assign", function(this)
@@ -270,6 +283,9 @@ end
 
 function CharacterTracker:paintTo(bb, x, y)
     self.visible_boxes = {}
+    if not self.mark_enabled then
+        return
+    end
     if not self.char_marks or #self.char_marks == 0 then
         return
     end
@@ -409,6 +425,14 @@ function CharacterTracker:_indexMarks()
     self.marks_by_page = by_page
 end
 
+function CharacterTracker:getMatchCap()
+    local cap = G_reader_settings:readSetting("character_tracker_max_matches_per_name", MAX_MATCHES_PER_NAME)
+    if type(cap) ~= "number" or cap < 1 then
+        return MAX_MATCHES_PER_NAME
+    end
+    return cap
+end
+
 --- Scan the document for a single character's name + aliases only.
 --- PERF: this is the key fix for "every edit re-scans the whole book".
 --- Adding/renaming/deleting an alias, adding a character, or renaming a
@@ -416,6 +440,7 @@ end
 --- characters. Cost of an edit is O(1 character) instead of O(n).
 function CharacterTracker:rebuildMarksForCharacter(char)
     if not self.ui.document then return end
+    if not self.mark_enabled then return end
     local names = { { text = char.name, char_name = char.name } }
     if char.aliases then
         for _j, alias in ipairs(char.aliases) do
@@ -423,9 +448,10 @@ function CharacterTracker:rebuildMarksForCharacter(char)
         end
     end
     local marks = {}
+    local cap = self:getMatchCap()
     for _i, name in ipairs(names) do
         if name.text and name.text ~= "" then
-            local res = self.ui.document:findAllText(name.text, true, 0, MAX_MATCHES_PER_NAME, false)
+            local res = self.ui.document:findAllText(name.text, true, 0, cap, false)
             if res then
                 for _j, item in ipairs(res) do
                     item.char_name = name.char_name
@@ -458,6 +484,13 @@ end
 --- changes at once). NOT called on individual edits anymore.
 function CharacterTracker:rebuildAllMarks()
     if not self.ui.document then return end
+    if not self.mark_enabled then
+        self.marks_by_charname = {}
+        self.marks_by_page = {}
+        self.char_marks = {}
+        self.visible_boxes = {}
+        return
+    end
     self.marks_by_charname = {}
     if #self.characters == 0 then
         self:_indexMarks()
@@ -468,6 +501,7 @@ function CharacterTracker:rebuildAllMarks()
     local info = InfoMessage:new{ text = _("Indexing character names…") }
     UIManager:show(info)
     UIManager:forceRePaint()
+    local cap = self:getMatchCap()
     local completed, results = Trapper:dismissableRunInSubprocess(function()
         local per_char = {}
         for _i, char in ipairs(self.characters) do
@@ -480,7 +514,7 @@ function CharacterTracker:rebuildAllMarks()
             local marks = {}
             for _j, name in ipairs(names) do
                 if name.text and name.text ~= "" then
-                    local res = self.ui.document:findAllText(name.text, true, 0, MAX_MATCHES_PER_NAME, false)
+                    local res = self.ui.document:findAllText(name.text, true, 0, cap, false)
                     if res then
                         for _k, item in ipairs(res) do
                             item.char_name = name.char_name
@@ -2106,6 +2140,51 @@ end
 -- MENU REGISTRATION
 -- ============================================================
 
+function CharacterTracker:showMatchCapDialog()
+    local current = self:getMatchCap()
+    local buttons = {}
+    local presets = { 400, 800, 1600 }
+    for _i, cap in ipairs(presets) do
+        local label = tostring(cap)
+        if cap == current then
+            label = "✓ " .. label
+        end
+        table.insert(buttons, {
+            {
+                text = label,
+                callback = function()
+                    UIManager:close(self._match_cap_dialog)
+                    self._match_cap_dialog = nil
+                    G_reader_settings:saveSetting("character_tracker_max_matches_per_name", cap)
+                    -- Re-scan with the new cap so the underline reflects it.
+                    if self.mark_enabled and next(self.marks_by_charname) then
+                        self:rebuildAllMarks()
+                    end
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Max matches per name set to %1."), cap),
+                        timeout = 2,
+                    })
+                end,
+            },
+        })
+    end
+    table.insert(buttons, {
+        {
+            text = _("Close"),
+            id = "close",
+            callback = function()
+                UIManager:close(self._match_cap_dialog)
+                self._match_cap_dialog = nil
+            end,
+        },
+    })
+    self._match_cap_dialog = ButtonDialog:new{
+        title = _("Max matches per name\nHigher = better coverage, more memory"),
+        buttons = buttons,
+    }
+    UIManager:show(self._match_cap_dialog)
+end
+
 function CharacterTracker:addToMainMenu(menu_items)
     menu_items.character_tracker = {
         text = _("Character Tracker"),
@@ -2133,11 +2212,29 @@ function CharacterTracker:addToMainMenu(menu_items)
                 callback = function()
                     self.mark_enabled = not self.mark_enabled
                     self.ui.doc_settings:saveSetting("character_tracker_underline", self.mark_enabled)
-                    -- PERF: mark_enabled changed - the rolling-mode paint
-                    -- cache key includes it, so no manual invalidation
-                    -- needed, but be explicit for clarity/future-proofing.
                     self._paint_cache_key = nil
+                    if self.mark_enabled then
+                        -- PERF: lazy build - only scan the book once when
+                        -- underlining is turned on and no marks exist yet.
+                        if not next(self.marks_by_charname) then
+                            self:rebuildAllMarks()
+                        end
+                    else
+                        -- PERF: free the mark tables entirely when underlining
+                        -- is off - nothing draws, nothing is tappable.
+                        self.marks_by_charname = {}
+                        self.marks_by_page = {}
+                        self.char_marks = {}
+                        self.visible_boxes = {}
+                    end
                     UIManager:setDirty(self.dialog, "ui")
+                end,
+            },
+            {
+                text = _("Max matches per name"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showMatchCapDialog()
                 end,
             },
             {
