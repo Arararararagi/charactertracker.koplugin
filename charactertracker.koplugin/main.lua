@@ -352,17 +352,16 @@ function CharacterTracker:_paintToPaging(bb, x, y)
     local page_marks = self.marks_by_page[cur_page]
     if not page_marks then return end
     for _i, mark in ipairs(page_marks) do
-        if mark.boxes then
-            for _j, box in ipairs(mark.boxes) do
-                local native_box = self.ui.document:nativeToPageRectTransform(cur_page, box)
-                if native_box then
-                    local screen_rect = self.view:pageToScreenTransform(cur_page, native_box)
-                    if screen_rect then
+        if mark.start and mark["end"] then
+            local boxes = self.ui.document:getScreenBoxesFromPositions(mark.start, mark["end"], true)
+            if boxes then
+                for _j, box in ipairs(boxes) do
+                    if box.h ~= 0 then
                         if self.mark_enabled then
-                            self.view:drawHighlightRect(bb, x, y, screen_rect, "underscore")
+                            self.view:drawHighlightRect(bb, x, y, box, "underscore")
                         end
                         table.insert(self.visible_boxes, {
-                            rect = screen_rect,
+                            rect = box,
                             char_name = mark.char_name,
                         })
                     end
@@ -383,11 +382,11 @@ function CharacterTracker:_indexMarks()
     for _char_name, marks in pairs(self.marks_by_charname) do
         for _i, mark in ipairs(marks) do
             table.insert(flat, mark)
-            if mark.start and by_page[mark.start] == nil and self.ui.paging then
-                by_page[mark.start] = {}
+            if mark.page and by_page[mark.page] == nil and self.ui.paging then
+                by_page[mark.page] = {}
             end
-            if self.ui.paging and mark.start then
-                table.insert(by_page[mark.start], mark)
+            if self.ui.paging and mark.page then
+                table.insert(by_page[mark.page], mark)
             end
         end
     end
@@ -1898,10 +1897,7 @@ function CharacterTracker:onAssignHighlightToCharacter(selected)
     local trimmed = selected_text:match("^%s*(.-)%s*$")
     local existing = self:getCharacterByName(trimmed)
     if existing then
-        UIManager:show(InfoMessage:new{
-            text = T(_("'%1' is already a known character."), existing.name),
-            timeout = 2,
-        })
+        self:showCharacterDetail(existing)
         return
     end
 
