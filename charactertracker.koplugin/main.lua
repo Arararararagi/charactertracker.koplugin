@@ -343,7 +343,11 @@ function CharacterTracker:_paintToRolling(bb, x, y)
 end
 
 function CharacterTracker:_paintToPaging(bb, x, y)
-    local cur_page = self.ui.document:getCurrentPage()
+    -- NOTE: do NOT use self.ui.document:getCurrentPage() here - that method
+    -- only exists on CreDocument (rolling docs). For paging documents
+    -- (PDF/DjVu) the current page lives in ReaderPaging.current_page, which
+    -- ReaderUI:getCurrentPage() resolves for us.
+    local cur_page = self:getCurrentPage()
     -- PERF: was `for _i, mark in ipairs(self.char_marks) do if mark.start == cur_page`,
     -- i.e. a full linear scan of EVERY mark in the book on EVERY paint,
     -- just to find the handful that belong to the current page. Marks
@@ -352,16 +356,23 @@ function CharacterTracker:_paintToPaging(bb, x, y)
     local page_marks = self.marks_by_page[cur_page]
     if not page_marks then return end
     for _i, mark in ipairs(page_marks) do
-        if mark.start and mark["end"] then
-            local boxes = self.ui.document:getScreenBoxesFromPositions(mark.start, mark["end"], true)
-            if boxes then
-                for _j, box in ipairs(boxes) do
-                    if box.h ~= 0 then
+        -- Kopt documents (PDF/DjVu) return marks shaped as
+        -- { start = <page number>, boxes = {native rects}, ... } - there is
+        -- no mark["end"] XPointer and no getScreenBoxesFromPositions here,
+        -- so draw each native rect through the page->screen transforms.
+        if mark.boxes then
+            for _j, box in ipairs(mark.boxes) do
+                local native_box = self.ui.document:nativeToPageRectTransform(cur_page, box)
+                if native_box then
+                    local screen_rect = self.view:pageToScreenTransform(cur_page, native_box)
+                    if screen_rect then
                         if self.mark_enabled then
-                            self.view:drawHighlightRect(bb, x, y, box, "underscore")
+                            self.view:drawHighlightRect(bb, x, y, screen_rect, "underscore")
                         end
+                        -- Keep page-space rect so onTapUnderline() (which
+                        -- compares against screenToPageTransform) matches.
                         table.insert(self.visible_boxes, {
-                            rect = box,
+                            rect = native_box,
                             char_name = mark.char_name,
                         })
                     end
@@ -382,11 +393,15 @@ function CharacterTracker:_indexMarks()
     for _char_name, marks in pairs(self.marks_by_charname) do
         for _i, mark in ipairs(marks) do
             table.insert(flat, mark)
-            if mark.page and by_page[mark.page] == nil and self.ui.paging then
-                by_page[mark.page] = {}
+            -- Kopt (PDF/DjVu) marks carry start = page number (no `page`
+            -- field exists in any findAllText output), and only paging
+            -- documents need a page bucket. CRE marks (XPointers) are
+            -- excluded by the self.ui.paging guard.
+            if self.ui.paging and mark.start and by_page[mark.start] == nil then
+                by_page[mark.start] = {}
             end
-            if self.ui.paging and mark.page then
-                table.insert(by_page[mark.page], mark)
+            if self.ui.paging and mark.start then
+                table.insert(by_page[mark.start], mark)
             end
         end
     end
