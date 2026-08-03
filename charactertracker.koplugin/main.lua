@@ -2253,6 +2253,138 @@ function CharacterTracker:getAvailableSeries()
     return series
 end
 
+--- Case-insensitive substring match against a character's name and aliases.
+function CharacterTracker:characterMatchesQuery(char, q)
+    if not q or q == "" then return false end
+    if char.name:lower():find(q, 1, true) then return true end
+    if char.aliases then
+        for _i, alias in ipairs(char.aliases) do
+            if alias:lower():find(q, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+function CharacterTracker:showSeriesCharacterSearch()
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Search series characters"),
+        input_hint = _("Name or alias to search for"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local q = dialog:getInputText():match("^%s*(.-)%s*$")
+                        UIManager:close(dialog)
+                        if q == "" then return end
+                        self:showSeriesSearchResults(q:lower())
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function CharacterTracker:showSeriesSearchResults(q)
+    -- Gather matches. When the current book is linked to a series its
+    -- characters ARE the series file's, so only scan the series files then.
+    local results = {}
+    if not self:getSeriesName() then
+        for _i, char in ipairs(self.characters) do
+            if self:characterMatchesQuery(char, q) then
+                table.insert(results, { char = char, source = _("This book") })
+            end
+        end
+    end
+    for _i, s in ipairs(self:getAvailableSeries()) do
+        local chars = self:loadCharactersFromFile(s.path)
+        for _j, char in ipairs(chars) do
+            if self:characterMatchesQuery(char, q) then
+                table.insert(results, { char = char, source = s.name })
+            end
+        end
+    end
+
+    if #results == 0 then
+        UIManager:show(InfoMessage:new{
+            text = T(_("No characters match '%1'."), q),
+        })
+        return
+    end
+
+    local item_table = {}
+    for _i, r in ipairs(results) do
+        local aliases = ""
+        if r.char.aliases and #r.char.aliases > 0 then
+            aliases = "\n    aka: " .. table.concat(r.char.aliases, ", ")
+        end
+        table.insert(item_table, {
+            text = r.char.name .. "  ·  " .. r.source .. aliases,
+            callback = function()
+                UIManager:close(self._search_menu)
+                self._search_menu = nil
+                local viewer
+                viewer = TextViewer:new{
+                    title = r.char.name .. " (" .. r.source .. ")",
+                    text = T(_("Rating: %1\nRole: %2\nNotes: %3"),
+                        starsString(r.char.rating or 0),
+                        getRoleLabel(r.char.role or ""),
+                        (r.char.notes and #r.char.notes > 0) and tostring(#r.char.notes) or _("none")),
+                    width = math.floor(Device.screen:getWidth() * 0.9),
+                    height = math.floor(Device.screen:getHeight() * 0.85),
+                    buttons_table = {
+                        {
+                            {
+                                text = _("Close"),
+                                id = "close",
+                                callback = function()
+                                    UIManager:close(viewer)
+                                end,
+                            },
+                        },
+                    },
+                }
+                UIManager:show(viewer)
+            end,
+        })
+    end
+
+    local menu_container
+    local menu
+    menu = Menu:new{
+        title = T(_("Search results: '%1' (%2)"), q, #results),
+        item_table = item_table,
+        is_borderless = true,
+        covers_fullscreen_widget = true,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        onMenuSelect = function(_self, item)
+            if item.callback then item.callback() end
+        end,
+        close_callback = function()
+            UIManager:close(menu_container)
+        end,
+    }
+    self._search_menu = menu
+    menu_container = CenterContainer:new{
+        dimen = Screen:getSize(),
+        menu,
+    }
+    menu.show_parent = menu_container
+    UIManager:show(menu_container)
+end
+
 -- ============================================================
 -- MENU REGISTRATION
 -- ============================================================
@@ -2352,6 +2484,13 @@ function CharacterTracker:addToMainMenu(menu_items)
                 keep_menu_open = false,
                 callback = function()
                     self:showMatchCapDialog()
+                end,
+            },
+            {
+                text = _("Search series characters"),
+                keep_menu_open = false,
+                callback = function()
+                    self:showSeriesCharacterSearch()
                 end,
             },
             {
